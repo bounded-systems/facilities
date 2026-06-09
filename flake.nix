@@ -53,6 +53,29 @@
             paths = [ prx pkgs.git pkgs.openssh pkgs.gh pkgs.cacert pkgs.coreutils pkgs.bashInteractive ];
             pathsToLink = [ "/bin" "/etc" "/share" ];
           };
+
+          # bd — the beads CLI (Go release binary, gastownhall/beads v1.0.3,
+          # linux_arm64). A normal ELF (not a bun blob), so autoPatchelf is safe
+          # here — it relinks against the image's nix libs (no-op if static).
+          bd = pkgs.stdenv.mkDerivation {
+            pname = "bd";
+            version = "1.0.3";
+            src = pkgs.fetchurl {
+              url = "https://github.com/gastownhall/beads/releases/download/v1.0.3/beads_1.0.3_linux_arm64.tar.gz";
+              sha256 = "0by17cf87jgb0g6i8g83xzgyz3sbcbkmgfdgzj44hy9f05srqfi4";
+            };
+            sourceRoot = "."; # flat tarball — loose files, no top-level dir
+            nativeBuildInputs = [ pkgs.autoPatchelfHook ];
+            buildInputs = [ pkgs.stdenv.cc.cc.lib ];
+            installPhase = "install -Dm755 bd $out/bin/bd";
+          };
+          beadsdRoot = pkgs.buildEnv {
+            name = "prx-beadsd-root";
+            # beadsd = `prx beads serve`; bd is the single-writer it wraps; dolt
+            # is the client that connects to the dolt-box.
+            paths = [ prx bd pkgs.dolt pkgs.git pkgs.cacert pkgs.coreutils pkgs.bashInteractive ];
+            pathsToLink = [ "/bin" "/etc" "/share" ];
+          };
         in
         {
           # `nix build .#dolt-image` → result tarball → `podman load -i result`
@@ -123,6 +146,41 @@
             };
           };
 
+          # beadsd-box (prx-634): the beads daemon, `prx beads serve`. bd is the
+          # single-writer; dolt is the client. CONNECTS to the dolt-box over the
+          # pod (DSN/adopt) rather than `bd dolt start` spawning its own — wired
+          # at run (prx-asr). Beads clone mounts /work; socket shared via /run.
+          beadsd-image = pkgs.dockerTools.buildLayeredImage {
+            name = "prx-beadsd";
+            tag = "dev";
+            contents = [ beadsdRoot ];
+            extraCommands = ''
+              mkdir -p etc tmp run work home/beads
+              chmod 1777 tmp
+              cat > etc/passwd <<EOF
+              root:x:0:0:root:/root:/bin/bash
+              beads:x:1000:1000:beads:/home/beads:/bin/bash
+              EOF
+              cat > etc/group <<EOF
+              root:x:0:
+              beads:x:1000:
+              EOF
+            '';
+            config = {
+              Entrypoint = [ "prx" ];
+              Cmd = [ "beads" "serve" "--socket" "/run/beadsd.sock" "--cwd" "/work" ];
+              WorkingDir = "/work";
+              User = "beads"; # ocap: non-root
+              Volumes = { "/run" = { }; };
+              Env = [
+                "HOME=/home/beads"
+                "PATH=/bin"
+                "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+                "LANG=C.UTF-8"
+              ];
+            };
+          };
+
           default = self.packages.${system}.dolt-image;
         })) // {
         # Expose under the darwin host so `nix build .#…-image` resolves and
@@ -130,6 +188,7 @@
         aarch64-darwin = {
           dolt-image = self.packages.aarch64-linux.dolt-image;
           keeperd-image = self.packages.aarch64-linux.keeperd-image;
+          beadsd-image = self.packages.aarch64-linux.beadsd-image;
           default = self.packages.aarch64-linux.dolt-image;
         };
       };
